@@ -23,8 +23,7 @@
   canvas { display:block; width:100%; height:100%; }
   h1 { font-size:17px; font-weight:700; margin:0 0 2px; letter-spacing:.2px; }
   .sub { color:var(--dim); font-size:12px; margin-bottom:16px; }
-  .sec { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.14em; color:var(--dim); margin:20px 0 8px; display:flex; align-items:center; gap:8px; }
-  .sec::after { content:""; flex:1; height:1px; background:var(--border); }
+  .sec { font-size:12px; font-weight:600; color:var(--dim); margin:20px 0 8px; padding-bottom:4px; border-bottom:1px solid var(--border); }
   label { display:block; font-size:12px; color:var(--dim); margin:8px 0 3px; }
   select,input[type=number] { width:100%; background:#fbfaf7; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:7px 9px; font-size:13px; font-family:inherit; }
   select:focus,input:focus { outline:none; border-color:var(--accent); }
@@ -76,7 +75,7 @@
     <div><label for="cols">Max cols</label><input id="cols" type="number" step="1" min="1" placeholder="auto"></div>
     <div><label for="rows">Max rows</label><input id="rows" type="number" step="1" min="1" placeholder="auto"></div>
   </div>
-  <div class="hint">X/Y: overall outline incl. leads. Z: seating plane to top (datasheet "A").</div>
+  <div class="hint">Dimensions should be full enclosing dimensions of component, including leads.</div>
   <label class="check"><input type="checkbox" id="twoParts"> Two package types</label>
 
   <div id="partBWrap" hidden>
