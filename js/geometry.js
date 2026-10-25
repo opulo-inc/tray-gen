@@ -2,11 +2,49 @@
 import {
   VISION_Z, TRAY_H, MIN_FLOOR, EDGE_WALL, PIN1_CHAMFER, CORNER_FILLET, TOP_CHAMFER,
   CB_DEPTH, MAX_PART_Z,
-  TRAY, HOLES, LATTICE_PITCH, SCREWS, DEFAULTS, LIMITS, CYL_SEGMENTS, WALL,
+  PLATE_Y, MIN_SPAN, MAX_SPAN, spanOutline, COLUMN_PITCH, LATTICE_PITCH, SCREWS, DEFAULTS, LIMITS, CYL_SEGMENTS, WALL,
 } from './constants.js';
 
 const num = (v, fallback) => (Number.isFinite(+v) ? +v : fallback);
 const round3 = (v) => Math.round(v * 1000) / 1000;
+
+function mergeIntervals(iv) {
+  if (!iv.length) return [];
+  iv.sort((a, b) => a[0] - b[0]);
+  const out = [iv[0].slice()];
+  for (let i = 1; i < iv.length; i++) {
+    const last = out[out.length - 1];
+    if (iv[i][0] <= last[1] + 1e-9) last[1] = Math.max(last[1], iv[i][1]);
+    else out.push(iv[i].slice());
+  }
+  return out;
+}
+
+// Plate lattice as origin + 15 mm steps. Origin is reduced into (-7.5, 7.5]
+// so a tray whose screws are offset from its center still lines up.
+export function latticeFrame(pts) {
+  const p = LATTICE_PITCH;
+  const mod = (v) => {
+    let m = ((v % p) + p) % p;
+    if (m > p / 2) m -= p;
+    return m;
+  };
+  const x = mod(pts[0][0]), y = mod(pts[0][1]);
+  const i = Math.round((pts[0][0] - x) / p);
+  const j = Math.round((pts[0][1] - y) / p);
+  return { x, y, parity: ((i + j) % 2 + 2) % 2 };
+}
+
+// Two screws, in the corners that share an edge with the pin-1 chamfer
+// (-X, +Y): bottom-left and top-right. Both are on the outer columns, one
+// lattice step in from the 120 mm plate edges, so they stay on the same rows
+// after the outline is shortened.
+export function mountingHoles(span) {
+  const { span: n } = spanOutline(span);
+  const x = (n - 1) / 2 * COLUMN_PITCH;
+  const y = PLATE_Y / 2 - LATTICE_PITCH;
+  return [[-x, -y], [x, y]];
+}
 
 export function holeParityOk([x, y]) {
   const i = Math.round(x / LATTICE_PITCH), j = Math.round(y / LATTICE_PITCH);
@@ -45,7 +83,8 @@ export function computePlan(raw) {
   const twoParts = raw.partB != null;
   const partB = twoParts ? readPart(raw.partB) : null;
   const split = Math.min(0.85, Math.max(0.15, num(raw.split, 0.5)));
-  const input = { screw: screwKey, clearance, wall, part, partB, twoParts, split, cols: colsOverride, rows: rowsOverride, colsB: colsBOverride, rowsB: rowsBOverride };
+  const span = Math.min(MAX_SPAN, Math.max(MIN_SPAN, Math.round(num(raw.span, MAX_SPAN))));
+  const input = { screw: screwKey, clearance, wall, part, partB, twoParts, split, span, cols: colsOverride, rows: rowsOverride, colsB: colsBOverride, rowsB: rowsBOverride };
   const validatePart = (p, tag) => {
     if (!(p.x > 0) || !(p.y > 0)) errors.push(`Part ${tag} X and Y must be > 0 mm.`);
     if (!(p.z > 0)) errors.push(`Part ${tag} Z (height) must be > 0 mm.`);
@@ -55,13 +94,15 @@ export function computePlan(raw) {
   validatePart(part, 'A');
   if (twoParts) validatePart(partB, 'B');
 
-  const outline = { x: TRAY.x, y: TRAY.y };
+  const outline = spanOutline(span);
   const innerW = outline.x - 2 * EDGE_WALL;
   const innerD = outline.y - 2 * EDGE_WALL;
 
   // ---- holes ----
-  const holes = HOLES.corners.map(([x, y]) => ({ x, y, thru: screw.thru, cbDia: screw.cbDia, cbDepth: CB_DEPTH }));
+  const holePts = mountingHoles(span);
+  const holes = holePts.map(([x, y]) => ({ x, y, thru: screw.thru, cbDia: screw.cbDia, cbDepth: CB_DEPTH }));
   const keepoutR = screw.cbDia / 2 + wall;
+  const lattice = latticeFrame(holePts);
 
   const specFor = (p) => {
     const pocket = { w: round3(p.x + 2 * clearance), d: round3(p.y + 2 * clearance) };
@@ -76,48 +117,94 @@ export function computePlan(raw) {
   if (!twoParts) {
     regions.push({ key: 'A', cx: 0, cy: 0, w: innerW, d: innerD, spec: specA });
   } else {
+    // Split along X. A top/bottom split was checked and fits fewer pockets:
+    // the mounting holes eat both ends of each band.
     const availW = innerW - wall;
     const wA = availW * split, wB = availW * (1 - split);
     regions.push({ key: 'A', cx: -innerW / 2 + wA / 2, cy: 0, w: wA, d: innerD, spec: specA });
     regions.push({ key: 'B', cx: innerW / 2 - wB / 2, cy: 0, w: wB, d: innerD, spec: specB });
   }
 
-  // Largest perfect grid centred in a region that clears every hole keepout.
-  // A centred grid can only clear a hole by stopping short of it on one axis,
-  // so try "columns avoid the hole X bands" and "rows avoid the hole Y bands"
-  // and keep whichever holds more pockets; exact-verify and shrink if needed.
-  function fitGrid(region, caps) {
+  // Largest full rectangle of pockets in the region. OpenPnP needs every
+  // cell filled, so the grid stays rectangular. A single part stays centered.
+  // Two parts may shift each grid off its region's center to clear the screws.
+  function fitGrid(region, caps, centered) {
     const { pocket, pitch } = region.spec;
     let maxCols = Math.floor((region.w + wall) / pitch.x + 1e-9);
     let maxRows = Math.floor((region.d + wall) / pitch.y + 1e-9);
     if (caps && caps.cols != null) maxCols = Math.min(maxCols, caps.cols);
     if (caps && caps.rows != null) maxRows = Math.min(maxRows, caps.rows);
-    if (maxCols < 1 || maxRows < 1) return { cols: 0, rows: 0 };
-    const nearHoles = holes.filter(h =>
-      Math.abs(h.x - region.cx) - region.w / 2 < pocket.w / 2 + keepoutR &&
-      Math.abs(h.y - region.cy) - region.d / 2 < pocket.d / 2 + keepoutR);
-    const colsAt = (c) => { const x0 = region.cx - ((c - 1) * pitch.x) / 2; return Array.from({ length: c }, (_, i) => x0 + i * pitch.x); };
-    const rowsAt = (r) => { const y0 = region.cy - ((r - 1) * pitch.y) / 2; return Array.from({ length: r }, (_, i) => y0 + i * pitch.y); };
-    const bandX = pocket.w / 2 + keepoutR, bandY = pocket.d / 2 + keepoutR;
-    let colsAvoid = 0;
-    for (let c = maxCols; c >= 1; c--) if (!colsAt(c).some(cx => nearHoles.some(h => Math.abs(cx - h.x) < bandX))) { colsAvoid = c; break; }
-    let rowsAvoid = 0;
-    for (let r = maxRows; r >= 1; r--) if (!rowsAt(r).some(cy => nearHoles.some(h => Math.abs(cy - h.y) < bandY))) { rowsAvoid = r; break; }
-    const cands = [];
-    if (colsAvoid >= 1) cands.push([colsAvoid, maxRows]);
-    if (rowsAvoid >= 1) cands.push([maxCols, rowsAvoid]);
-    if (!cands.length) return { cols: 0, rows: 0 };
-    cands.sort((a, b) => (b[0] * b[1]) - (a[0] * a[1]) || (b[0] - a[0]));
-    let c = cands[0][0], r = cands[0][1];
-    const clear = (nc, nr) => {
-      for (const cx of colsAt(nc)) for (const cy of rowsAt(nr))
+    if (maxCols < 1 || maxRows < 1) return { cols: 0, rows: 0, x0: 0, y0: 0 };
+    const xMin = region.cx - region.w / 2 + pocket.w / 2;
+    const xMaxE = region.cx + region.w / 2 - pocket.w / 2;
+    const yMin = region.cy - region.d / 2 + pocket.d / 2;
+    const yMaxE = region.cy + region.d / 2 - pocket.d / 2;
+    const clear = (x0, y0, cols, rows) => {
+      for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+        const cx = x0 + i * pitch.x, cy = y0 + j * pitch.y;
+        if (cx < xMin - 1e-6 || cx > xMaxE + 1e-6 || cy < yMin - 1e-6 || cy > yMaxE + 1e-6) return false;
         for (const h of holes) if (rectHitsCircle(cx, cy, pocket.w, pocket.d, h.x, h.y, keepoutR)) return false;
+      }
       return true;
     };
-    while (c > 1 && !clear(c, r)) c--;
-    while (r > 1 && !clear(c, r)) r--;
-    if (!clear(c, r)) return { cols: 0, rows: 0 };
-    return { cols: c, rows: r };
+    let best = null;
+    for (let rows = maxRows; rows >= 1; rows--) {
+      if (best && maxCols * rows <= best.cols * best.rows) break;
+      const ySpan = (rows - 1) * pitch.y;
+      const y0Lo = yMin, y0Hi = yMaxE - ySpan;
+      if (y0Hi < y0Lo - 1e-9) continue;
+      for (let cols = maxCols; cols >= 1; cols--) {
+        if (best && cols * rows <= best.cols * best.rows) break;
+        const xSpan = (cols - 1) * pitch.x;
+        const x0Lo = xMin, x0Hi = xMaxE - xSpan;
+        if (x0Hi < x0Lo - 1e-9) continue;
+        const cx0 = region.cx - xSpan / 2, cy0 = region.cy - ySpan / 2;
+        if (centered) {
+          if (cy0 < y0Lo - 1e-9 || cy0 > y0Hi + 1e-9) continue;
+          if (cx0 < x0Lo - 1e-9 || cx0 > x0Hi + 1e-9) continue;
+          if (!clear(cx0, cy0, cols, rows)) continue;
+          best = { cols, rows, x0: cx0, y0: cy0 };
+          break;
+        }
+        let found = null;
+        for (let y0 = y0Lo; y0 <= y0Hi + 1e-6; y0 += 0.5) {
+          const yy = Math.min(y0, y0Hi);
+          const bad = [];
+          for (let j = 0; j < rows; j++) {
+            const cy = yy + j * pitch.y;
+            for (const h of holes) {
+              const dyOut = Math.max(Math.abs(h.y - cy) - pocket.d / 2, 0);
+              if (dyOut >= keepoutR) continue;
+              const reach = Math.sqrt(keepoutR * keepoutR - dyOut * dyOut);
+              bad.push([h.x - pocket.w / 2 - reach - 0.02, h.x + pocket.w / 2 + reach + 0.02]);
+            }
+          }
+          const forbid = [];
+          for (const [a, b] of bad) for (let i = 0; i < cols; i++) forbid.push([a - i * pitch.x, b - i * pitch.x]);
+          const blocked = mergeIntervals(forbid);
+          let cursor = x0Lo;
+          const gaps = [];
+          for (const [a, b] of blocked) {
+            if (b < cursor) continue;
+            if (a > cursor) gaps.push([cursor, Math.min(a, x0Hi)]);
+            cursor = Math.max(cursor, b);
+            if (cursor > x0Hi) break;
+          }
+          if (cursor <= x0Hi + 1e-9) gaps.push([cursor, x0Hi]);
+          for (const [g0, g1] of gaps) {
+            if (g1 < g0 - 1e-6) continue;
+            const x0 = cx0 < g0 ? g0 : cx0 > g1 ? g1 : cx0;
+            if (!clear(x0, yy, cols, rows)) continue;
+            const dist = (x0 - cx0) ** 2 + (yy - cy0) ** 2;
+            if (!found || dist < found.dist) found = { x0, y0: yy, dist };
+          }
+        }
+        if (!found) continue;
+        best = { cols, rows, x0: found.x0, y0: found.y0 };
+        break;
+      }
+    }
+    return best || { cols: 0, rows: 0, x0: 0, y0: 0 };
   }
 
   // ---- pockets ----
@@ -128,14 +215,13 @@ export function computePlan(raw) {
       const caps = region.key === 'A'
         ? { cols: colsOverride, rows: rowsOverride }
         : { cols: colsBOverride, rows: rowsBOverride };
-      const g = fitGrid(region, caps);
+      const g = fitGrid(region, caps, !twoParts);
       grids[region.key] = g;
       if (g.cols < 1 || g.rows < 1) {
         warnings.push(`Part ${region.key}: no pocket fits in its region. Move the split slider or shrink the part.`);
         continue;
       }
-      const x0 = region.cx - ((g.cols - 1) * region.spec.pitch.x) / 2;
-      const y0 = region.cy - ((g.rows - 1) * region.spec.pitch.y) / 2;
+      const x0 = g.x0, y0 = g.y0;
       for (let ri = 0; ri < g.rows; ri++) for (let ci = 0; ci < g.cols; ci++) {
         pockets.push({
           cx: round3(x0 + ci * region.spec.pitch.x), cy: round3(y0 + ri * region.spec.pitch.y),
@@ -172,6 +258,7 @@ export function computePlan(raw) {
     ok: errors.length === 0,
     errors, warnings, input,
     outline, trayH: TRAY_H,
+    latticeOrigin: { x: lattice.x, y: lattice.y }, latticeParity: lattice.parity,
     floorZ: specA.floorZ, pocket: specA.pocket, pitch: specA.pitch,
     parts: {
       A: { part, floorZ: specA.floorZ, pocket: specA.pocket },

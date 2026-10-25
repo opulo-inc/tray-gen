@@ -4,8 +4,8 @@ import ModuleFactory from 'manifold';
 import { computePlan, buildTray } from './geometry.js';
 import { buildBinarySTL } from './stl.js';
 import { buildStep } from './step.js';
-import { PACKAGE_GROUPS, findPackage } from './packages.js';
-import { LATTICE_PITCH } from './constants.js';
+import { PACKAGE_GROUPS, findPackage, CUSTOM_ID } from './packages.js';
+import { LATTICE_PITCH, MIN_SPAN, MAX_SPAN, spanOutline } from './constants.js';
 
 // ---------- engine init ----------
 const mod = await ModuleFactory(); mod.setup();
@@ -17,14 +17,19 @@ const els = {
   screw: $('screw'),
   pkg: $('pkg'), px: $('px'), py: $('py'), pz: $('pz'),
   clearance: $('clearance'), cols: $('cols'), rows: $('rows'),
+  span: $('span'), spanLabel: $('spanLabel'), sizeLabel: $('sizeLabel'),
   twoParts: $('twoParts'), partBWrap: $('partBWrap'), split: $('split'), splitLabel: $('splitLabel'),
   pkgB: $('pkgB'), pxB: $('pxB'), pyB: $('pyB'), pzB: $('pzB'), colsB: $('colsB'), rowsB: $('rowsB'),
   hud: $('hud'),
   dlStl: $('dlStl'), dlStep: $('dlStep'),
 };
 
-// ---------- package dropdowns (presets only, no Custom) ----------
+// ---------- package dropdowns ----------
 function fillPackageSelect(sel) {
+  const custom = document.createElement('option');
+  custom.value = CUSTOM_ID;
+  custom.textContent = 'Custom';
+  sel.appendChild(custom);
   for (const g of PACKAGE_GROUPS) {
     const og = document.createElement('optgroup');
     og.label = g.group;
@@ -60,6 +65,8 @@ function applyHash() {
     if (q.get('c')) els.clearance.value = q.get('c');
     if (q.get('cols')) els.cols.value = q.get('cols');
     if (q.get('rows')) els.rows.value = q.get('rows');
+    if (q.get('span')) els.span.value = q.get('span');
+    else if (q.get('hw') === '1') els.span.value = '4';
     if (q.get('t') === '1') els.twoParts.checked = true;
     if (q.get('split')) els.split.value = q.get('split');
     if (q.get('pkgB')) els.pkgB.value = q.get('pkgB');
@@ -75,6 +82,7 @@ function writeHash() {
     s: els.screw.value,
     pkg: els.pkg.value, x: els.px.value, y: els.py.value, z: els.pz.value,
     c: els.clearance.value, cols: els.cols.value, rows: els.rows.value,
+    span: els.span.value,
     t: els.twoParts.checked ? '1' : '0', split: els.split.value,
     pkgB: els.pkgB.value, xb: els.pxB.value, yb: els.pyB.value, zb: els.pzB.value,
     colsB: els.colsB.value, rowsB: els.rowsB.value,
@@ -83,7 +91,7 @@ function writeHash() {
 }
 
 // ---------- input ----------
-function pkgName(sel) { const p = findPackage(sel.value); return p ? p.name : 'part'; }
+function pkgName(sel) { const p = findPackage(sel.value); return p ? p.name : 'Custom'; }
 function readInput() {
   const inp = {
     screw: els.screw.value,
@@ -91,6 +99,7 @@ function readInput() {
     part: { name: pkgName(els.pkg), x: +els.px.value, y: +els.py.value, z: +els.pz.value },
     cols: els.cols.value === '' ? null : +els.cols.value,
     rows: els.rows.value === '' ? null : +els.rows.value,
+    span: +els.span.value,
   };
   if (els.twoParts.checked) {
     inp.partB = { name: pkgName(els.pkgB), x: +els.pxB.value, y: +els.pyB.value, z: +els.pzB.value };
@@ -176,16 +185,18 @@ function updateLattice(plan) {
   plateSlab.position.set(0, 0, -1.5);
   plateGroup.add(plateSlab);
 
-  const used = new Set(plan.holes.map(h => `${h.x},${h.y}`));
   const holeGeo = new THREE.CylinderGeometry(1.6, 1.6, 0.15, 16);
   holeGeo.rotateX(Math.PI / 2); // align cylinder axis to +Z
   const inst = [];
-  for (let i = -Math.ceil(W / 2 / LATTICE_PITCH); i <= Math.ceil(W / 2 / LATTICE_PITCH); i++) {
-    for (let j = -Math.ceil(D / 2 / LATTICE_PITCH); j <= Math.ceil(D / 2 / LATTICE_PITCH); j++) {
-      if (((i + j) % 2 + 2) % 2 !== 0) continue;  // even parity only
-      const x = i * LATTICE_PITCH, y = j * LATTICE_PITCH;
+  const iMax = Math.ceil(W / 2 / LATTICE_PITCH) + 1;
+  const jMax = Math.ceil(D / 2 / LATTICE_PITCH) + 1;
+  for (let i = -iMax; i <= iMax; i++) {
+    for (let j = -jMax; j <= jMax; j++) {
+      if (((i + j) % 2 + 2) % 2 !== (plan.latticeParity || 0)) continue;
+      const x = (plan.latticeOrigin?.x || 0) + i * LATTICE_PITCH;
+      const y = (plan.latticeOrigin?.y || 0) + j * LATTICE_PITCH;
       if (Math.abs(x) > W / 2 - 2 || Math.abs(y) > D / 2 - 2) continue;
-      inst.push({ x, y, used: used.has(`${x},${y}`) });
+      inst.push({ x, y, used: plan.holes.some(h => Math.abs(h.x - x) < 1e-6 && Math.abs(h.y - y) < 1e-6) });
     }
   }
   for (const mat of [latticeMat, usedHoleMat]) {
@@ -199,7 +210,7 @@ function updateLattice(plan) {
   }
 }
 
-let framed = false;
+let framedOutline = '';
 function reframe(outline) {
   const r = Math.hypot(outline.x, outline.y) / 2 + 30;
   camera.position.set(r * 0.9, -r * 1.15, r * 0.95);
@@ -266,10 +277,10 @@ function geometryFromMesh(mesh) {
 // ---------- HUD ----------
 function renderHud(plan) {
   if (!plan.ok) {
-    els.hud.style.color = '#c0392b';
+    els.hud.style.color = '#000';
     els.hud.textContent = plan.errors.join(' · ');
   } else {
-    els.hud.style.color = '#6e6a5e';
+    els.hud.style.color = '#000';
     els.hud.textContent = '';
   }
 }
@@ -291,7 +302,8 @@ async function rebuild() {
   trayMesh.geometry = geometryFromMesh(built.mesh);
   updateEdges();
   updateGhostParts(plan); updateLattice(plan);
-  if (!framed) { reframe(plan.outline); framed = true; }
+  const outlineKey = `${plan.outline.x}x${plan.outline.y}`;
+  if (framedOutline !== outlineKey) { reframe(plan.outline); framedOutline = outlineKey; }
   setDownloadsEnabled(true);
   window.__trayGen = { plan, mesh: built.mesh, rebuild, renderer, buildBinarySTL, buildStep };
   writeHash();
@@ -316,10 +328,18 @@ for (const e of [dimsA.x, dimsA.y, dimsA.z, dimsB.x, dimsB.y, dimsB.z]) {
   e.addEventListener('change', scheduleRebuild);
 }
 function syncTwoParts() { els.partBWrap.hidden = !els.twoParts.checked; }
+function syncSpan() {
+  const n = Math.min(MAX_SPAN, Math.max(MIN_SPAN, Math.round(+els.span.value || MAX_SPAN)));
+  els.span.value = String(n);
+  const size = spanOutline(n);
+  els.spanLabel.textContent = n === 1 ? '1 column' : `${n} columns`;
+  els.sizeLabel.textContent = size.label + ' tray for the staging plate.';
+}
 function syncSplitLabel() {
   const v = +els.split.value;
   els.splitLabel.textContent = `A ${v}% / B ${100 - v}%`;
 }
+els.span.addEventListener('input', () => { syncSpan(); scheduleRebuild(); });
 els.twoParts.addEventListener('change', () => { syncTwoParts(); scheduleRebuild(); });
 els.split.addEventListener('input', () => { syncSplitLabel(); scheduleRebuild(); });
 for (const e of [els.screw, els.clearance, els.cols, els.rows, els.colsB, els.rowsB]) {
@@ -336,6 +356,7 @@ function fileBase() {
     const ptB = p.input.partB;
     base += `+${safeName(ptB.name)}`;
   }
+  if (p.input.span < MAX_SPAN) base += `_${p.input.span}col`;
   return base;
 }
 function download(blob, filename) {
@@ -357,9 +378,16 @@ els.dlStep.addEventListener('click', () => {
 
 // ---------- boot ----------
 applyHash();
-if (els.px.value === '') selectPackage(els.pkg, 'lqfp48', dimsA);
-if (els.pxB.value === '') selectPackage(els.pkgB, 'soic8', dimsB);
+if (els.px.value === '') {
+  els.pkg.value = CUSTOM_ID;
+  els.px.value = 5; els.py.value = 5; els.pz.value = 1;
+}
+if (els.pxB.value === '') {
+  els.pkgB.value = CUSTOM_ID;
+  els.pxB.value = 5; els.pyB.value = 5; els.pzB.value = 1;
+}
 if (els.clearance.value === '') els.clearance.value = 0.3;
+syncSpan();
 syncTwoParts();
 syncSplitLabel();
 resize();
